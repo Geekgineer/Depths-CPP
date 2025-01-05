@@ -1,0 +1,1 @@
+cd build/ && ./camera_depth_estimation ../models/vits_qint8.onnx 5 both

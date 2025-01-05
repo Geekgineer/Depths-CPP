@@ -1,0 +1,1 @@
+cd build/ && ./image_depth_estimation ../models/vits_qint8.onnx ../data/indoor.jpg
