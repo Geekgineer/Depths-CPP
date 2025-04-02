@@ -23,7 +23,24 @@ It features:
 
 Supports flexible execution providers: **TensorRT**, **CUDA**, or **CPU**.
 
-![Demo](data/ferris_wheel_depth.gif)
+## 📰 Latest Updates
+
+#### 📌 Pinned
+
+- **[2025.04.01]** 🔥 **Depths-CPP v2 Released**  
+  The entire codebase has been reworked for improved efficiency, cleaner architecture, and added support for batch processing.
+
+- **[2024.12.15]** 🚀 **Initial Release of Depths-CPP**  
+  Launched the first version of Depths-CPP — a high-performance depth estimation application in C++.
+  
+
+<img src="data/ferris_wheel_depth.gif" alt="Video Demo" width="900">
+<img src="data/depths_realtime_demo.gif" alt="Camera Demo" width="500">
+
+
+
+
+
 ---
 
 ## 📦 Integration in your C++ project
@@ -125,7 +142,6 @@ Run inference from camera, image, or video:
 ./run_camera.sh
 ```
 
-<img src="data/cam_demo.png" alt="Camera Demo" width="500">
 
 ---
 
