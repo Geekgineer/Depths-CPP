@@ -1,1 +1,1 @@
-cd build/ && ./video_depth_estimation ../models/vits_qint8.onnx ../data/ferris_wheel.mp4 ../data/ferris_wheel_depth.mp4 
+cd build/ && ./video_depth_estimation ../models/vits.onnx ../data/ferris_wheel.mp4 ../data/ferris_wheel_depth.mp4 

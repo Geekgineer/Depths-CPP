@@ -4,7 +4,7 @@ CURRENT_DIR=$(cd "$(dirname "$0")"; pwd)
 # ONNXRUNTIME_VERSION="1.16.3" 
 ONNXRUNTIME_VERSION="1.19.2" 
 
-ONNXRUNTIME_GPU=0
+ONNXRUNTIME_GPU=1
 
 # Platform
 platform="$(uname -s)"
