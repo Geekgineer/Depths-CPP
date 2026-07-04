@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <chrono>
+#include <cstdlib>   // std::getenv
 #include <exception> // Needed for std::exception
 
 void processAndWriteFrame(const cv::Mat& frame, const cv::Mat& depthMap, cv::VideoWriter& writer) {
@@ -46,9 +47,15 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        // === Initialize DepthAnything ===
-        bool useCuda = true;  // Set to false to disable GPU
-        DepthAnything depthEstimator(modelPath, useCuda);
+        // === Initialize the depth engine ===
+        depth::Config cfg;
+        cfg.modelPath = modelPath;
+        cfg.provider = depth::Provider::Auto;      // TensorRT -> CUDA -> CPU
+        cfg.precision = depth::Precision::FP16;
+        cfg.resizeMode = depth::ResizeMode::AspectLongest;
+        cfg.process_res = 518;                     // quality-oriented for offline video
+        cfg.maxBatchSize = 16;
+        DepthAnything depthEstimator(cfg);
 
         // === Open the input video ===
         cv::VideoCapture cap(inputVideoPath);
@@ -57,26 +64,18 @@ int main(int argc, char* argv[]) {
             return -1;
         }
 
-        // Define the target dimensions for processing (required by the depth model)
-        int targetWidth = 518;
-        int targetHeight = 518;
         double fps = cap.get(cv::CAP_PROP_FPS);
-        
-        // Choose codec: try H.264 first; fallback to mp4v if needed
-        int fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
-        if (fourcc == -1) {
-            fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-        }
+        if (fps <= 0.0) fps = 30.0;
 
-        // Create the VideoWriter using the target dimensions.
-        // Note: the output frame is the horizontal concatenation of two frames.
+        // The writer is opened lazily once the first frame's size is known so
+        // the original aspect ratio is preserved (output = frame | depth).
+        // mp4v is used by default because it is the most portable H.264-free
+        // encoder across OpenCV/FFMPEG builds (H.264 via FFMPEG frequently
+        // reports success yet writes nothing). Set DEPTH_FOURCC=H264 to override.
         cv::VideoWriter writer;
-        writer.open(outputVideoPath, fourcc, fps, cv::Size(targetWidth * 2, targetHeight), true);
-        if (!writer.isOpened()) {
-            std::cerr << "Error: Cannot open output writer: " << outputVideoPath << std::endl;
-            return -1;
-        }
-        writer.set(cv::VIDEOWRITER_PROP_QUALITY, 95); // Set quality (0-100)
+        int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+        if (const char *env = std::getenv("DEPTH_FOURCC"); env && std::string(env).size() == 4)
+            fourcc = cv::VideoWriter::fourcc(env[0], env[1], env[2], env[3]);
 
         std::cout << "Processing video: " << inputVideoPath << std::endl;
         std::cout << "Output video: " << outputVideoPath << " (Codec: " << fourcc << ")" << std::endl;
@@ -87,16 +86,28 @@ int main(int argc, char* argv[]) {
         std::vector<cv::Mat> batchDepths;
         int frameCount = 0;
 
+        auto ensureWriter = [&](const cv::Mat &frame) {
+            if (writer.isOpened()) return;
+            const cv::Size outSize(frame.cols * 2, frame.rows);
+            writer.open(outputVideoPath, fourcc, fps, outSize, true);
+            if (!writer.isOpened()) {
+                // Requested encoder unavailable in this OpenCV build; fall back.
+                fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+                writer.open(outputVideoPath, fourcc, fps, outSize, true);
+            }
+            if (writer.isOpened())
+                writer.set(cv::VIDEOWRITER_PROP_QUALITY, 95);
+        };
+
         while (true) {
             cv::Mat frame;
             if (!cap.read(frame)) break;
 
-            // Resize the frame to the target dimensions required by the depth model
-            cv::Mat resized;
-            cv::resize(frame, resized, cv::Size(targetWidth, targetHeight));
-            batchFrames.push_back(resized);
+            // Feed the original frame; the engine resizes internally with the
+            // correct aspect ratio.
+            batchFrames.push_back(frame);
 
-            if (batchFrames.size() == batchSize) {
+            if (static_cast<int>(batchFrames.size()) == batchSize) {
                 auto start = std::chrono::high_resolution_clock::now();
                 batchDepths = depthEstimator.predictBatch(batchFrames);
                 auto end = std::chrono::high_resolution_clock::now();
@@ -106,7 +117,11 @@ int main(int argc, char* argv[]) {
 
                 for (size_t i = 0; i < batchFrames.size(); ++i) {
                     frameCount++;
-                    std::cout << "Writing frame " << frameCount << "\n";
+                    ensureWriter(batchFrames[i]);
+                    if (frameCount == 1 && !writer.isOpened()) {
+                        std::cerr << "Error: Cannot open output writer: " << outputVideoPath << std::endl;
+                        return -1;
+                    }
                     processAndWriteFrame(batchFrames[i], batchDepths[i], writer);
                 }
 
@@ -120,7 +135,11 @@ int main(int argc, char* argv[]) {
             batchDepths = depthEstimator.predictBatch(batchFrames);
             for (size_t i = 0; i < batchFrames.size(); ++i) {
                 frameCount++;
-                std::cout << "Writing frame " << frameCount << "\n";
+                ensureWriter(batchFrames[i]);
+                if (frameCount == 1 && !writer.isOpened()) {
+                    std::cerr << "Error: Cannot open output writer: " << outputVideoPath << std::endl;
+                    return -1;
+                }
                 processAndWriteFrame(batchFrames[i], batchDepths[i], writer);
             }
         }

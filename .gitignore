@@ -1,0 +1,22 @@
+# Build output
+build/
+*.o
+*.obj
+
+# Downloaded ONNX Runtime (fetched by build.sh)
+onnxruntime-*/
+onnxruntime-*.tgz
+
+# TensorRT engine cache (generated at runtime)
+trt_engine_cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

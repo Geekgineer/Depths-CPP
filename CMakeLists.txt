@@ -1,66 +1,58 @@
-cmake_minimum_required(VERSION 3.0.0)
-project(yolo_ort)
+cmake_minimum_required(VERSION 3.14)
+project(depths_cpp LANGUAGES CXX)
 
-option(ONNXRUNTIME_DIR "Path to built ONNX Runtime directory." STRING)
+# --- Options -----------------------------------------------------------------
+option(ONNXRUNTIME_DIR "Path to the ONNX Runtime directory." "")
 message(STATUS "ONNXRUNTIME_DIR: ${ONNXRUNTIME_DIR}")
 
-find_package(OpenCV REQUIRED)
+if(NOT ONNXRUNTIME_DIR)
+    message(FATAL_ERROR "ONNXRUNTIME_DIR is not set. Pass -DONNXRUNTIME_DIR=... (build.sh does this automatically).")
+endif()
 
-include_directories("include/")
-
-# Add executable for image depth estimation
-add_executable(image_depth_estimation
-               src/image_depth_estimation.cpp)
-
-# Add executable for camera depth estimation
-add_executable(camera_depth_estimation
-src/camera_depth_estimation.cpp)
-
-# Add executable for camera depth estimation
-add_executable(video_depth_estimation
-src/video_depth_estimation.cpp)
-
-
-set(CMAKE_CXX_STANDARD 14)
+# --- Standards / defaults ----------------------------------------------------
+set(CMAKE_CXX_STANDARD 17)          # <filesystem>, <optional> are used by the apps
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Set include directories for all executables
-target_include_directories(image_depth_estimation PRIVATE "${ONNXRUNTIME_DIR}/include")
-target_include_directories(camera_depth_estimation PRIVATE "${ONNXRUNTIME_DIR}/include")
-target_include_directories(video_depth_estimation PRIVATE "${ONNXRUNTIME_DIR}/include")
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
-# Set compile features for all executables
-target_compile_features(image_depth_estimation PRIVATE cxx_std_14)
-target_compile_features(camera_depth_estimation PRIVATE cxx_std_14)
-target_compile_features(video_depth_estimation PRIVATE cxx_std_14)
+# --- Dependencies ------------------------------------------------------------
+find_package(OpenCV REQUIRED)
+find_package(Threads REQUIRED)
 
-# Link libraries for all executables
-target_link_libraries(image_depth_estimation ${OpenCV_LIBS})
-target_link_libraries(camera_depth_estimation ${OpenCV_LIBS})
-target_link_libraries(video_depth_estimation ${OpenCV_LIBS})
-
-
-if(UNIX)
-    message(STATUS "We are building on Linux!")
-    # Specific Linux build commands or flags
-    target_link_libraries(image_depth_estimation "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so") 
-    target_link_libraries(camera_depth_estimation "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so") 
-    target_link_libraries(video_depth_estimation "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so") 
-
-endif(UNIX)
-
-if(APPLE)
-    message(STATUS "We are building on macOS!")
-    # Specific macOS build commands or flags
-    target_link_libraries(image_depth_estimation "${ONNXRUNTIME_DIR}/lib/libonnxruntime.dylib")
-    target_link_libraries(camera_depth_estimation "${ONNXRUNTIME_DIR}/lib/libonnxruntime.dylib")
-    target_link_libraries(video_depth_estimation "${ONNXRUNTIME_DIR}/lib/libonnxruntime.dylib")
-endif(APPLE)
-
+# Resolve the ONNX Runtime shared library for the current platform.
 if(WIN32)
-    message(STATUS "We are building on Windows!")
-    # Specific Windows build commands or flags
-    target_link_libraries(image_depth_estimation "${ONNXRUNTIME_DIR}/lib/onnxruntime.lib")
-    target_link_libraries(camera_depth_estimation "${ONNXRUNTIME_DIR}/lib/onnxruntime.lib")
-    target_link_libraries(video_depth_estimation "${ONNXRUNTIME_DIR}/lib/onnxruntime.lib")
-endif(WIN32)
+    set(ORT_LIB "${ONNXRUNTIME_DIR}/lib/onnxruntime.lib")
+elseif(APPLE)
+    set(ORT_LIB "${ONNXRUNTIME_DIR}/lib/libonnxruntime.dylib")
+else()
+    set(ORT_LIB "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so")
+endif()
+
+# --- Targets -----------------------------------------------------------------
+set(DEPTH_APPS
+    image_depth_estimation
+    video_depth_estimation
+    camera_depth_estimation)
+
+foreach(app ${DEPTH_APPS})
+    add_executable(${app} src/${app}.cpp)
+    target_include_directories(${app} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${ONNXRUNTIME_DIR}/include"
+        ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(${app} PRIVATE
+        ${OpenCV_LIBS}
+        ${ORT_LIB}
+        Threads::Threads)
+    # Let executables find libonnxruntime.so next to them at runtime.
+    set_target_properties(${app} PROPERTIES
+        BUILD_RPATH "${ONNXRUNTIME_DIR}/lib"
+        INSTALL_RPATH "${ONNXRUNTIME_DIR}/lib")
+endforeach()
+
+message(STATUS "Depths-CPP configured (C++${CMAKE_CXX_STANDARD}, ${CMAKE_BUILD_TYPE}). "
+               "TensorRT/CUDA are used automatically when the GPU ONNX Runtime build "
+               "and their runtime libraries are present.")

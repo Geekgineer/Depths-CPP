@@ -51,9 +51,10 @@ int main(int argc, char* argv[]) {
     std::filesystem::create_directories(outputDir);
 
     try {
-        // Initialize the DepthAnything object with the path to your ONNX model
-        // Set useCuda to true to enable GPU acceleration (if available)
-        bool useCuda = false; // Set to true if you have CUDA-enabled GPU and want to use it
+        // Initialize the depth engine. useCuda=true selects the best available
+        // provider automatically (TensorRT -> CUDA -> CPU); it transparently
+        // falls back to CPU when no GPU build/runtime is present.
+        bool useCuda = true;
         DepthAnything depthEstimator(modelPath, useCuda);
         
         // Determine if input is a directory or a single file

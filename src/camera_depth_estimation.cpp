@@ -213,13 +213,14 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // Model resolution parameter
-    // int modelResolution = 384; // Default resolution
-    int modelResolution = 256; // Default resolution
+    // Model resolution parameter: the engine resizes each frame so its LONGEST
+    // side equals this value (rounded to a multiple of the patch size). Smaller
+    // = faster, larger = sharper depth. 266 (= 19*14) is a good realtime default.
+    int modelResolution = 266; // Default resolution
     if (argc == 6) {
         modelResolution = std::atoi(argv[5]);
-        if (modelResolution < 128 || modelResolution > 512) {
-            std::cerr << "Invalid model resolution: " << argv[5] << ". Valid range is 128-512." << std::endl;
+        if (modelResolution < 126 || modelResolution > 1036) {
+            std::cerr << "Invalid model resolution: " << argv[5] << ". Valid range is 126-1036." << std::endl;
             return -1;
         }
     }
@@ -255,9 +256,17 @@ int main(int argc, char *argv[])
 
     try
     {
-        // Initialize the DepthAnything object with CUDA if available
-        bool useCuda = true;
-        DepthAnything depthEstimator(modelPath, useCuda);
+        // Initialize the depth engine. The camera pipeline favours latency, so
+        // we set a small process resolution and let the GPU providers
+        // (TensorRT -> CUDA -> CPU) be selected automatically with FP16.
+        depth::Config cfg;
+        cfg.modelPath = modelPath;
+        cfg.provider = depth::Provider::Auto;
+        cfg.precision = depth::Precision::FP16;
+        cfg.resizeMode = depth::ResizeMode::AspectLongest;
+        cfg.process_res = modelResolution;
+        cfg.maxBatchSize = 8;
+        DepthAnything depthEstimator(cfg);
 
         // Open the camera with optimized settings
         cv::VideoCapture cap;
@@ -394,9 +403,6 @@ int main(int argc, char *argv[])
                 batchFrames.reserve(batchSize);
                 originalFramePtrs.reserve(batchSize);
 
-                // Pre-allocate common matrices
-                cv::Mat resizedBuffer(modelResolution, modelResolution, CV_8UC3); // Pre-allocate resize buffer
-
                 while (running) {
                     
                     // Update adaptive batch size based on performance metrics
@@ -425,18 +431,12 @@ int main(int argc, char *argv[])
                         
                         auto framePtr = std::move(optFrame.value());
                         originalFramePtrs.push_back(framePtr);
-                        
-                        // Resize to model's optimal input size
-                        // cv::Mat resized;
-                        // cv::Size optimalSize(384, 384); // Adjust based on your model's optimal size
-                        // cv::resize(*framePtr, resized, optimalSize);
-                        // batchFrames.push_back(resized);
-                        
 
-                        // Resize to model's optimal input size - consider using a smaller resolution
-                        cv::Size optimalSize(modelResolution, modelResolution); // Smaller resolution for faster processing
-                        cv::resize(*framePtr, resizedBuffer, optimalSize);
-                        batchFrames.push_back(resizedBuffer.clone()); // Only clone here when necessary
+                        // Feed the full frame; the engine performs a single
+                        // aspect-preserving resize to `process_res` internally.
+                        // This is a shallow header copy (pixel data is owned by
+                        // originalFramePtrs for the batch's lifetime).
+                        batchFrames.push_back(*framePtr);
 
                         // Don't wait for a full batch if frames are available and we have enough to process
                         if (i >= 2 && frameQueue.size() == 0) {
@@ -553,39 +553,6 @@ int main(int argc, char *argv[])
                         shouldDisplay = true;
                         cv::applyColorMap(*depthPtr, toDisplay, cv::COLORMAP_TURBO); // TURBO gives better depth visualization
                     }
-                    // else if (displayMode == DisplayMode::BOTH && framePtr) {
-                    //     shouldDisplay = true;
-                    //     toDisplay = framePtr->clone();
-                        
-                    //     // If we have a depth map, show it
-                    //     if (depthPtr) {
-                    //         // Apply color map to depth map for better visualization
-                    //         cv::Mat depthColor;
-                    //         cv::applyColorMap(*depthPtr, depthColor, cv::COLORMAP_TURBO);
-    
-                    //         // Resize depthColor to match frame size if necessary
-                    //         if (depthColor.size() != framePtr->size()) {
-                    //             cv::resize(depthColor, depthColor, framePtr->size());
-                    //         }
-    
-                    //         // Create a horizontal layout instead of vertical for better viewing on most displays
-                    //         cv::hconcat(*framePtr, depthColor, toDisplay);
-                            
-                    //         // Optional: Add a blended view as a third panel
-                    //         // Uncomment if you want the three-panel view
-                    //         // /*
-                    //         // Add transparency overlay for depth information over original image
-                    //         // cv::Mat blendedView;
-                    //         // cv::addWeighted(*framePtr, 0.7, depthColor, 0.3, 0, blendedView);
-                            
-                    //         // // Create a three-panel view: original, depth, blended
-                    //         // cv::Mat threePanel;
-                    //         // cv::hconcat(toDisplay, blendedView, threePanel);
-                    //         // toDisplay = threePanel;
-                    //         // */
-                    //     }
-                    // }
-
                     else if (displayMode == DisplayMode::BOTH && framePtr && depthPtr) {
                         shouldDisplay = true;
                         toDisplay = *framePtr; // Avoid unnecessary clone
