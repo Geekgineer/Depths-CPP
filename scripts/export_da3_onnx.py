@@ -15,10 +15,32 @@
 #   output "depth" : float32 (N, 1, H, W)   relative (inverse) or metric depth
 #   output "sky"   : float32 (N, 1, H, W)   ONLY for metric models (--metric)
 #
-# The exported graph deliberately stops at (backbone + depth head); the Python
-# API's data-dependent post-processing (sky in-painting, camera/pose decode,
+# The default graph deliberately stops at (backbone + depth head): the Python
+# API's *data-dependent* post-processing (sky in-painting, metric alignment,
 # Gaussian-splat branch) is skipped because it does not trace to a static ONNX
 # graph and is not needed for depth inference.
+#
+# -----------------------------------------------------------------------------
+# Camera / multi-view mode (--camera)
+# -----------------------------------------------------------------------------
+# The raw camera-pose decode (cam_dec -> pose_encoding_to_extri_intri ->
+# affine_inverse) IS statically traceable - unlike the sky/alignment/GS steps
+# above, it contains no quantile/.item()/python-int branches. `--camera` exports
+# a batched multi-view graph that treats the N inputs as N views of ONE scene
+# (B=1, S=N) so the backbone's cross-view attention runs, and adds camera pose:
+#
+#   input  "image"      : float32 (N, 3, H, W)   N views of one scene (fixed N,H,W)
+#   output "depth"      : float32 (N, 1, H, W)
+#   output "confidence" : float32 (N, 1, H, W)   depth confidence
+#   output "extrinsics" : float32 (N, 3, 4)      world-to-camera [R|t]
+#   output "intrinsics" : float32 (N, 3, 3)      pinhole K in pixels
+#
+# Camera mode is exported STATIC (fixed N/H/W): the view count is baked into the
+# cross-view attention, and the intrinsics' principal point / focal (cx=W/2,
+# cy=H/2, f from FoV) are resolution-dependent constants. Re-export for a
+# different view count or resolution. Requires a multi-view DA3 model that has a
+# camera decoder (da3-small/base/large/giant) - NOT a mono/metric or nested
+# model. Consume the result with scripts/run_da3_camera_onnx.py.
 #
 # Requirements (run on a machine with the DA3 stack installed):
 #   pip install depth-anything-3 onnx onnxsim
@@ -32,6 +54,10 @@
 #   # Metric depth (adds the "sky" output):
 #   python scripts/export_da3_onnx.py --model da3metric-large --metric \
 #       --process-res 504 --output models/da3metric_large.onnx
+#
+#   # Multi-view depth + camera pose (extrinsics/intrinsics), 2 views @ 504 px:
+#   python scripts/export_da3_onnx.py --model da3-large --camera \
+#       --num-views 2 --process-res 504 --output models/da3_large_cam.onnx
 #
 # Exporter compatibility (IMPORTANT):
 #   DA3 variants differ in which ops they use, and PyTorch's two ONNX exporters
@@ -110,6 +136,79 @@ class DepthExportWrapper(nn.Module):
         return depth
 
 
+class CameraExportWrapper(nn.Module):
+    """Wraps a multi-view DA3 net into a batched depth + camera-pose graph.
+
+    Input : (N, 3, H, W) ImageNet-normalized RGB - N views of ONE scene, batched
+            as (B=1, S=N) so the backbone's cross-view attention is exercised
+            (unlike DepthExportWrapper, which uses B=N, S=1 independent views).
+    Output: depth       (N, 1, H, W)   relative (inverse) depth
+            confidence  (N, 1, H, W)   depth confidence
+            extrinsics  (N, 3, 4)      world-to-camera [R|t]
+            intrinsics  (N, 3, 3)      pinhole K (pixels)
+
+    This mirrors DepthAnything3Net.forward / _process_camera_estimation exactly:
+    the reference view is fixed to view 0 ("first"), which makes reference-view
+    selection a constant index (torch.zeros) rather than a data-dependent op, so
+    the whole graph stays statically traceable.
+    """
+
+    def __init__(self, net: nn.Module, ref_view_strategy: str = "first"):
+        super().__init__()
+        # Reuse the model's own pose math so the export stays faithful to the
+        # PyTorch reference implementation (verified to trace to ONNX).
+        from depth_anything_3.model.utils.transform import pose_encoding_to_extri_intri
+        from depth_anything_3.utils.geometry import affine_inverse
+
+        if getattr(net, "cam_dec", None) is None:
+            raise AttributeError(
+                "Camera export requires a multi-view DA3 model with a camera "
+                "decoder (net.cam_dec). The loaded model has none - use a "
+                "da3-small/base/large/giant variant, not a mono/metric or "
+                "nested-metric model."
+            )
+        self.net = net
+        self.ref_view_strategy = ref_view_strategy
+        self._pose_to_extri_intri = pose_encoding_to_extri_intri
+        self._affine_inverse = affine_inverse
+
+    def forward(self, image: torch.Tensor):
+        n = image.shape[0]
+        h, w = image.shape[-2], image.shape[-1]
+
+        # (N, 3, H, W) -> (B=1, S=N, 3, H, W): one scene, N cross-attended views.
+        x = image.unsqueeze(0)
+
+        feats, _aux = self.net.backbone(
+            x,
+            cam_token=None,
+            export_feat_layers=[],
+            ref_view_strategy=self.ref_view_strategy,
+        )
+        out = self.net.head(feats, h, w, patch_start_idx=0)
+
+        depth = out["depth"].reshape(n, 1, h, w).contiguous()
+
+        conf_key = next((k for k in ("depth_conf", "conf") if k in out), None)
+        if conf_key is None:
+            raise KeyError(
+                "Camera export expected a depth-confidence output but the head "
+                f"produced none; available head keys: {list(out.keys())}"
+            )
+        confidence = out[conf_key].reshape(n, 1, h, w).contiguous()
+
+        # Camera branch: pose encoding -> (c2w, K) -> world-to-camera extrinsics.
+        # feats[-1][1] is the camera token (see backbone get_intermediate_layers).
+        pose_enc = self.net.cam_dec(feats[-1][1])
+        c2w, ixt = self._pose_to_extri_intri(pose_enc, (h, w))
+        w2c = self._affine_inverse(c2w)  # world-to-camera [R|t]
+
+        extrinsics = w2c.reshape(n, 3, 4).contiguous()
+        intrinsics = ixt.reshape(n, 3, 3).contiguous()
+
+        return depth, confidence, extrinsics, intrinsics
+
+
 def load_model(model_name: str, device: str):
     """Load a DA3 model via the official API and return its inner nn.Module."""
     from depth_anything_3.api import DepthAnything3
@@ -139,6 +238,19 @@ def main():
                     help="Reference tracing resolution (longest side, ÷14).")
     ap.add_argument("--metric", action="store_true",
                     help="Also export the metric 'sky' output.")
+    ap.add_argument("--camera", action="store_true",
+                    help="Export batched multi-view depth + camera pose "
+                         "(depth, confidence, extrinsics, intrinsics). Treats "
+                         "the N inputs as N views of one scene (cross-view "
+                         "attention). Forces a static graph; requires a "
+                         "multi-view DA3 model with a camera decoder.")
+    ap.add_argument("--num-views", type=int, default=2,
+                    help="Number of views per scene for --camera (baked into "
+                         "the static graph; re-export to change it).")
+    ap.add_argument("--ref-view-strategy", default="first",
+                    help="Reference-view strategy for --camera. 'first' keeps "
+                         "the graph static/traceable; content-based strategies "
+                         "(saddle_balanced) introduce data-dependent ops.")
     ap.add_argument("--fp16", action="store_true", help="Cast weights to float16.")
     ap.add_argument("--opset", type=int, default=17, help="ONNX opset version.")
     ap.add_argument("--no-simplify", action="store_true",
@@ -154,6 +266,10 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
+    if args.camera and args.metric:
+        ap.error("--camera and --metric are mutually exclusive: camera pose "
+                 "needs a multi-view model, metric adds the nested sky branch.")
+
     # Round the reference resolution to a multiple of 14.
     res = max(14, round(args.process_res / 14) * 14)
     if res != args.process_res:
@@ -162,22 +278,40 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
 
     net = load_model(args.model, args.device)
-    wrapper = DepthExportWrapper(net, metric=args.metric).to(args.device).eval()
+
+    if args.camera:
+        # Pose is view-count- and resolution-dependent: always export static.
+        if not args.static:
+            print("[export] --camera implies a static graph; forcing --static.")
+            args.static = True
+        if args.num_views < 1:
+            ap.error("--num-views must be >= 1.")
+        wrapper = CameraExportWrapper(
+            net, ref_view_strategy=args.ref_view_strategy,
+        ).to(args.device).eval()
+    else:
+        wrapper = DepthExportWrapper(net, metric=args.metric).to(args.device).eval()
 
     dtype = torch.float16 if args.fp16 else torch.float32
     if args.fp16:
         wrapper = wrapper.half()
 
-    dummy = torch.randn(1, 3, res, res, device=args.device, dtype=dtype)
+    batch = args.num_views if args.camera else 1
+    dummy = torch.randn(batch, 3, res, res, device=args.device, dtype=dtype)
 
-    output_names = ["depth"] + (["sky"] if args.metric else [])
+    if args.camera:
+        output_names = ["depth", "confidence", "extrinsics", "intrinsics"]
+    else:
+        output_names = ["depth"] + (["sky"] if args.metric else [])
+
     dynamic_axes = None
     if not args.static:
         dynamic_axes = {"image": {0: "batch", 2: "height", 3: "width"}}
         for name in output_names:
             dynamic_axes[name] = {0: "batch", 2: "height", 3: "width"}
 
-    print(f"[export] tracing {args.model} at {res}x{res} ({dtype}) ...")
+    view_note = f" ({args.num_views} views)" if args.camera else ""
+    print(f"[export] tracing {args.model} at {res}x{res}{view_note} ({dtype}) ...")
     export_kwargs = dict(
         input_names=["image"],
         output_names=output_names,
@@ -214,10 +348,15 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"[export] onnxsim skipped: {e}")
 
-    # Preprocessing reminder for the C++ side.
-    print("\n[export] DONE. C++ preprocessing contract:")
+    # Preprocessing reminder for consumers.
+    print("\n[export] DONE. Preprocessing contract:")
     print(f"         RGB, /255, mean={IMAGENET_MEAN}, std={IMAGENET_STD}, ÷14")
-    print("         (this is the default in include/depth_anything.hpp)")
+    if args.camera:
+        print(f"         outputs: {output_names}")
+        print(f"         static {args.num_views}-view graph at {res}x{res}; "
+              "consume with scripts/run_da3_camera_onnx.py")
+    else:
+        print("         (this is the default in include/depth_anything.hpp)")
 
 
 if __name__ == "__main__":

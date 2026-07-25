@@ -93,6 +93,30 @@ python scripts/export_da3_onnx.py --model da3metric-large --metric \
 
 The graph exposes input `image` `(N,3,H,W)` and output `depth` `(N,1,H,W)` (plus `sky` for metric), with dynamic batch/height/width. See [`scripts/export_da3_onnx.py`](scripts/export_da3_onnx.py) for the full contract and exporter options.
 
+#### Multi-view depth + camera pose (`--camera`)
+
+DA3 natively predicts per-view camera **extrinsics** and **intrinsics** from a set of views of one scene. The `--camera` mode exports a batched multi-view graph that runs the backbone's cross-view attention and the camera decoder, exposing pose alongside depth:
+
+```bash
+# 2 views of one scene @ 504 px -> depth + confidence + extrinsics + intrinsics:
+python scripts/export_da3_onnx.py --model da3-large --camera \
+    --num-views 2 --process-res 504 --output models/da3_large_cam.onnx
+
+# Run it (preprocessing is handled for you):
+pip install onnxruntime numpy pillow
+python scripts/run_da3_camera_onnx.py --model models/da3_large_cam.onnx \
+    view0.jpg view1.jpg --save-npz scene.npz
+```
+
+| Output | Shape | Meaning |
+|---|---|---|
+| `depth` | `(N,1,H,W)` | relative (inverse) depth per view |
+| `confidence` | `(N,1,H,W)` | depth confidence per view |
+| `extrinsics` | `(N,3,4)` | world-to-camera `[R\|t]` per view |
+| `intrinsics` | `(N,3,3)` | pinhole `K` (pixels) per view |
+
+The `N` inputs are treated as `N` views of a **single** scene (`B=1, S=N`), so unlike the depth-only export they are cross-attended rather than independent. Requires a multi-view DA3 model with a camera decoder (`da3-small/base/large/giant`) — not a mono/metric or nested-metric variant. The camera graph is exported **static** (the view count is baked into cross-view attention, and the intrinsics' focal/principal-point are resolution-dependent), so re-export to change `--num-views` or resolution. The depth-only C++ engine (`include/depth_anything.hpp`) keys on the `depth` output and simply ignores the extra pose outputs. `tests/test_camera_decode_trace.py` verifies the pose decode traces to ONNX and matches PyTorch.
+
 > **Exporter tip:** PyTorch's two ONNX exporters support different ops, and DA3 variants differ in which they use. If the default export hits `aten::cartesian_prod`, retry with `--dynamo`; for a RoPE backbone that trips `torch.export`, add `--static`. If both fail on a variant, pin the torch version used by the community exporters ([MoonCodeMaster](https://github.com/MoonCodeMaster/Depth-Anything-3-Onnx) / [devin-lai](https://github.com/devin-lai/Depth-Anything-3-Onnx)). The C++ engine consumes any valid DA3 depth ONNX regardless of how it was produced.
 
 ### Depth Anything 2
@@ -286,6 +310,7 @@ Use the ARM64 GPU build of ONNX Runtime and JetPack's CUDA/TensorRT. The engine 
 - [x] Depth Anything V3 support (relative, mono, metric) with graph auto-detection
 - [x] TensorRT execution provider (FP16 + engine cache)
 - [x] DA3 ONNX export script
+- [x] Multi-view camera pose export (extrinsics/intrinsics) + Python consumer
 - [ ] CUDA I/O binding (zero device↔host copies) for the GPU path
 - [ ] Point-cloud / stereo (anaglyph) export
 - [ ] Prebuilt binaries & CI matrix (Linux/macOS/Windows)
